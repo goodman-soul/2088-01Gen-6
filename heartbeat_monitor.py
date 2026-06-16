@@ -11,8 +11,9 @@ from datetime import datetime, timedelta
 class TaskState(Enum):
     RUNNING = "running"
     LOST_CONTACT = "lost_contact"
-    STOPPED = "stopped"
     STOPPING = "stopping"
+    STOPPED = "stopped"
+    FORCE_STOPPED = "force_stopped"
 
 
 @dataclass
@@ -72,7 +73,6 @@ class TaskWorker:
 
     def start(self):
         self._info.start_time = datetime.now()
-        self._info.last_heartbeat = datetime.now()
         self._info.state = TaskState.RUNNING
         self._info.stop_event.clear()
 
@@ -91,8 +91,10 @@ class TaskWorker:
         self._info.thread.start()
 
     def request_stop(self):
-        if self._info.state in (TaskState.RUNNING, TaskState.LOST_CONTACT):
+        if self._info.state == TaskState.RUNNING:
             self._info.state = TaskState.STOPPING
+            self._info.stop_event.set()
+        elif self._info.state == TaskState.LOST_CONTACT:
             self._info.stop_event.set()
 
     def is_alive(self) -> bool:
@@ -154,24 +156,42 @@ class HeartbeatMonitor:
             worker.request_stop()
 
         for worker in self._tasks.values():
-            worker.join(timeout=5.0)
             info = worker.info
-            if info.state != TaskState.STOPPED:
-                info.state = TaskState.STOPPED
+            if info.state in (TaskState.STOPPED, TaskState.FORCE_STOPPED):
+                continue
+            worker.join(timeout=5.0)
+            if not worker.is_alive():
+                if info.state != TaskState.STOPPED:
+                    info.state = TaskState.STOPPED
+                    if info.end_time is None:
+                        info.end_time = datetime.now()
+                    if info.exit_code is None:
+                        info.exit_code = -1
+            else:
+                info.state = TaskState.FORCE_STOPPED
                 if info.end_time is None:
                     info.end_time = datetime.now()
                 if info.exit_code is None:
-                    info.exit_code = -1
+                    info.exit_code = -9
 
     def _check_tasks(self):
         now = datetime.now()
         with self._lock:
             for worker in self._tasks.values():
                 info = worker.info
-                if info.state == TaskState.STOPPED:
+                if info.state in (TaskState.STOPPED, TaskState.FORCE_STOPPED):
                     continue
 
                 if info.state == TaskState.STOPPING:
+                    if not worker.is_alive():
+                        info.state = TaskState.STOPPED
+                        if info.end_time is None:
+                            info.end_time = now
+                        if info.exit_code is None:
+                            info.exit_code = -1
+                    continue
+
+                if info.state == TaskState.LOST_CONTACT:
                     if not worker.is_alive():
                         info.state = TaskState.STOPPED
                         if info.end_time is None:
@@ -202,6 +222,13 @@ class HeartbeatMonitor:
 
     def generate_report(self) -> str:
         now = datetime.now()
+        state_names = {
+            TaskState.RUNNING: "运行中",
+            TaskState.LOST_CONTACT: "失联",
+            TaskState.STOPPING: "停止中",
+            TaskState.STOPPED: "已停止",
+            TaskState.FORCE_STOPPED: "强制停止",
+        }
         lines = []
         lines.append("=" * 72)
         lines.append("  任务心跳监控报告")
@@ -209,7 +236,7 @@ class HeartbeatMonitor:
         lines.append("=" * 72)
         lines.append("")
 
-        header = f"{'任务ID':<10} {'名称':<16} {'状态':<12} {'最近心跳':<20} {'运行时长':<14} {'退出码':<8}"
+        header = f"{'任务ID':<10} {'名称':<16} {'状态':<10} {'最近心跳':<20} {'运行时长':<14} {'退出码':<8}"
         lines.append(header)
         lines.append("-" * 72)
 
@@ -217,7 +244,7 @@ class HeartbeatMonitor:
             for worker in self._tasks.values():
                 info = worker.info
 
-                state_str = info.state.value
+                state_str = state_names.get(info.state, info.state.value)
 
                 if info.last_heartbeat:
                     last_hb_str = info.last_heartbeat.strftime("%H:%M:%S")
@@ -239,7 +266,7 @@ class HeartbeatMonitor:
                 else:
                     exit_str = "-"
 
-                line = f"{info.task_id:<10} {info.name:<16} {state_str:<12} {last_hb_str:<20} {duration_str:<14} {exit_str:<8}"
+                line = f"{info.task_id:<10} {info.name:<16} {state_str:<10} {last_hb_str:<20} {duration_str:<14} {exit_str:<8}"
                 lines.append(line)
 
         lines.append("")
@@ -247,10 +274,14 @@ class HeartbeatMonitor:
 
         running = sum(1 for w in self._tasks.values() if w.info.state == TaskState.RUNNING)
         lost = sum(1 for w in self._tasks.values() if w.info.state == TaskState.LOST_CONTACT)
-        stopped = sum(1 for w in self._tasks.values() if w.info.state == TaskState.STOPPED)
         stopping = sum(1 for w in self._tasks.values() if w.info.state == TaskState.STOPPING)
+        stopped = sum(1 for w in self._tasks.values() if w.info.state == TaskState.STOPPED)
+        force_stopped = sum(1 for w in self._tasks.values() if w.info.state == TaskState.FORCE_STOPPED)
 
-        lines.append(f"  汇总: 运行中={running}  失联={lost}  停止中={stopping}  已停止={stopped}")
+        lines.append(
+            f"  汇总: 运行中={running}  失联={lost}  停止中={stopping}  "
+            f"已停止={stopped}  强制停止={force_stopped}"
+        )
         lines.append("=" * 72)
 
         return "\n".join(lines)
@@ -306,16 +337,38 @@ def error_exit_worker(stop_event: threading.Event, heartbeat: Callable) -> int:
     return 2
 
 
+def silent_worker(stop_event: threading.Event, heartbeat: Callable) -> int:
+    """沉默任务：从不发送心跳（模拟启动后卡死）"""
+    while not stop_event.is_set():
+        stop_event.wait(1.0)
+    return 0
+
+
+def stubborn_worker(stop_event: threading.Event, heartbeat: Callable) -> int:
+    """顽固任务：忽略停止信号，一直运行（测试强制停止）"""
+    count = 0
+    while True:
+        heartbeat()
+        count += 1
+        for _ in range(20):
+            if stop_event.is_set():
+                pass
+            time.sleep(0.1)
+    return 0
+
+
 def main():
-    monitor = HeartbeatMonitor(check_interval=1.0, default_timeout=6.0)
+    monitor = HeartbeatMonitor(check_interval=0.5, default_timeout=3.0)
 
     workers = [
-        TaskWorker("数据采集", healthy_worker, heartbeat_interval=2.0, timeout=6.0),
-        TaskWorker("日志处理", healthy_worker, heartbeat_interval=2.0, timeout=6.0),
-        TaskWorker("慢速同步", slow_heartbeat_worker, heartbeat_interval=4.5, timeout=10.0),
-        TaskWorker("不稳定节点", flaky_worker, heartbeat_interval=2.0, timeout=6.0),
-        TaskWorker("健康检查", quick_exit_worker, heartbeat_interval=1.0, timeout=6.0),
-        TaskWorker("异常服务", error_exit_worker, heartbeat_interval=1.0, timeout=6.0),
+        TaskWorker("数据采集", healthy_worker, heartbeat_interval=1.0, timeout=3.0),
+        TaskWorker("日志处理", healthy_worker, heartbeat_interval=1.0, timeout=3.0),
+        TaskWorker("慢速同步", slow_heartbeat_worker, heartbeat_interval=2.5, timeout=5.0),
+        TaskWorker("不稳定节点", flaky_worker, heartbeat_interval=1.0, timeout=3.5),
+        TaskWorker("沉默僵尸", silent_worker, heartbeat_interval=1.0, timeout=3.0),
+        TaskWorker("顽固服务", stubborn_worker, heartbeat_interval=0.5, timeout=3.0),
+        TaskWorker("健康检查", quick_exit_worker, heartbeat_interval=1.0, timeout=3.0),
+        TaskWorker("异常服务", error_exit_worker, heartbeat_interval=1.0, timeout=3.0),
     ]
 
     print("[MAIN] 启动心跳监控器...")
@@ -336,9 +389,9 @@ def main():
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    report_interval = 8.0
+    report_interval = 4.0
     last_report_time = time.monotonic()
-    total_run_time = 30.0
+    total_run_time = 12.0
     start = time.monotonic()
 
     while True:
@@ -351,7 +404,7 @@ def main():
             print(monitor.generate_report())
             last_report_time = now
 
-        time.sleep(1.0)
+        time.sleep(0.5)
 
     print("\n[MAIN] 运行结束，正在关闭所有任务...")
     monitor.stop()
